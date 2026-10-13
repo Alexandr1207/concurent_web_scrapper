@@ -1,0 +1,8 @@
+https://books.toscrape.com
+https://quotes.toscrape.com
+https://example.com
+https://go.dev
+https://gobyexample.com
+https://httpstat.us/404
+https://localhost:1
+https://httpbin.org/delay/10
