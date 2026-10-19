@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,12 +26,18 @@ type Result struct {
 
 var titleRe = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 
-func fetch(client *http.Client, url string) Result {
+func fetch(ctx context.Context, client *http.Client, url string) Result {
 	start := time.Now()
 
 	res := Result{URL: url}
 
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		res.Err = err
+		res.Duration = time.Since(start)
+		return res
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		res.Err = err
 		res.Duration = time.Since(start)
@@ -96,37 +104,57 @@ func (s *Stats) PrintStats() {
 	fmt.Println("Total size:", s.totalSize)
 }
 
-func runSequential(client *http.Client, urls []string, s *Stats) []Result {
-	results := make([]Result, len(urls))
-	for i, url := range urls {
-		r := fetch(client, url)
-		results[i] = r
-		s.Add(r)
-	}
-
-	return results
+type FetchJob struct {
+	Id  int
+	URL string
 }
 
-func runConcurrent(client *http.Client, urls []string, s *Stats) []Result {
+type FetchResult struct {
+	JobId int
+	R     Result
+}
+
+func runPool(ctx context.Context, client *http.Client, urls []string, workers int, s *Stats) []Result {
+	jobs := make(chan FetchJob)
+	results := make(chan FetchResult)
 	var wg sync.WaitGroup
 
-	sem := make(chan struct{}, 5)
-
-	results := make([]Result, len(urls))
-	for i, url := range urls {
-		wg.Go(func() {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			r := fetch(client, url) // no races
-			results[i] = r
-			s.Add(r)
-		})
-
+	for i := 1; i <= workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				r := fetch(ctx, client, j.URL)
+				results <- FetchResult{JobId: j.Id, R: r}
+				s.Add(r)
+			}
+		}()
 	}
-	wg.Wait()
 
-	return results
+	go func() {
+		defer close(jobs)
+		for i, url := range urls {
+			select {
+			case jobs <- FetchJob{Id: i, URL: url}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	out := make([]Result, len(urls))
+	for i, u := range urls {
+		out[i] = Result{URL: u, Err: errors.New("not started")}
+	}
+	for fr := range results {
+		out[fr.JobId] = fr.R
+	}
+	return out
 }
 
 func LoadUrls(file string) []string {
@@ -157,26 +185,29 @@ func LoadUrls(file string) []string {
 
 func main() {
 	timeout := flag.Duration("timeout", 5*time.Second, "таймаут одного запроса")
-	file := flag.String("file", "", "файл со списком URL (по одному в строке)")
+	total := flag.Duration("total", 30*time.Second, "общий таймаут на весь пул")
+	workers := flag.Int("workers", 5, "число воркеров пула")
+	file := flag.String("file", "", "файл со списком URL")
 	flag.Parse()
 
+	if *workers <= 0 {
+		log.Fatalf("-workers must be > 0, got %d", *workers)
+	}
+
 	client := &http.Client{Timeout: *timeout}
-	// urls := []string{"https://books.toscrape.com", "https://quotes.toscrape.com", "https://example.com", "https://go.dev", "https://gobyexample.com", "https://httpstat.us/404", "https://localhost:1", "https://httpbin.org/delay/10"}
 	urls := LoadUrls(*file)
 
-	start := time.Now()
-	seqStats := &Stats{}
-	seq := runSequential(client, urls, seqStats)
-	seqStats.PrintStats()
-	printResults(seq)
-	end := time.Since(start)
-	fmt.Println("Sequential completed with time: ", end) // 8.4217687s
+	ctx, cancel := context.WithTimeout(context.Background(), *total)
+	defer cancel()
 
-	start = time.Now()
+	start := time.Now()
 	concStats := &Stats{}
-	conc := runConcurrent(client, urls, concStats)
+	conc := runPool(ctx, client, urls, *workers, concStats)
 	concStats.PrintStats()
 	printResults(conc)
-	end = time.Since(start)
-	fmt.Println("Concurrent completed with time: ", end) // 5.0018447s
+	fmt.Println("Concurrent completed with time: ", time.Since(start))
+
+	if err := ctx.Err(); err != nil {
+		fmt.Println("pool stopped:", err)
+	}
 }
